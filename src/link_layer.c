@@ -121,6 +121,11 @@ int llOpenTx(LinkLayer llParameters)
     // Wait until all bytes have been written to the serial port
     sleep(1);
 
+    if (receiveSupervisionFrame(A_TX, C_UA) != 0 ){
+        return -1; 
+    }
+
+    printf("Step 6 done, call prof\n");
     // Close serial port
     if (closeSerialPort() < 0)
     {
@@ -147,7 +152,7 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     printf("Serial port %s opened\n", llParameters.serialPort);
-    if (receiveSupervisionFrame(A_RX, C_SET) != 0) {
+    if (receiveSupervisionFrame(A_TX, C_SET) != 0) {
         return -1; 
     }
     printf("SET received\n");
@@ -157,14 +162,15 @@ int llOpenRx(LinkLayer llParameters)
     unsigned char buf[SUPERVISION_FRAME_SIZE] = {0};
 
     buf[0] = FLAG; 
-    buf[1] = A_RX; 
+    buf[1] = A_TX; 
     buf[2] = C_UA; 
-    buf[3] = A_RX ^ C_UA; 
+    buf[3] = A_TX ^ C_UA; 
     buf[4] = FLAG; 
 
     int bytes = writeBytesSerialPort(buf, SUPERVISION_FRAME_SIZE);
     printf("%d bytes written to serial port\n", bytes);
 
+    printf("Step 6 done, call prof\n");
     // Close serial port
     if (closeSerialPort() < 0)
     {
