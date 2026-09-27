@@ -25,6 +25,17 @@
 #define C_SET 0x03
 #define C_UA 0x07
 
+
+//states
+typedef enum {
+    START, 
+    FLAG_RCV, 
+    A_RCV, 
+    C_RCV, 
+    BCC_OK, 
+    STOP
+} State; 
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -92,28 +103,50 @@ int llOpenRx(LinkLayer llParameters)
     // It must be changed in order to respect the specifications of the protocol indicated in the Lab guide.
 
     // TODO: Save the received bytes in a buffer array and print it at the end of the program.
-    volatile int STOP = FALSE;
-    int nBytesBuf = 0;
+    State s = START; 
 
-    while (STOP == FALSE)
+    while (s != STOP)
     {
-        // Read one byte from serial port.
-        // NOTE: You must check how many bytes were actually read by reading the return value.
-        // In this example, we assume that the byte is always read, which may not be true.
         unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        nBytesBuf += bytes;
-        printf("var = 0x%02X\n", byte);
 
+        // If read was unsuccessful, retry
+        if (readByteSerialPort(&byte) <= 0){
+            continue; 
+        }
 
-        if (byte == 'z')
-        {
-            printf("Received 'z' char. Stop reading from serial port.\n");
-            STOP = TRUE;
+        switch (s){
+            case START:
+                if (byte == FLAG) s = FLAG_RCV;
+                break; 
+            
+            case FLAG_RCV:
+                if (byte == A_TX) s = A_RCV; 
+                else if (byte == FLAG) s = FLAG_RCV;
+                else s= START; 
+                break; 
+
+            case A_RCV: 
+                if (byte == C_SET) s = C_RCV; 
+                else if (byte == FLAG) s = FLAG_RCV; 
+                else s = START; 
+                break; 
+
+            case C_RCV: 
+                if (byte == (A_TX ^ C_SET)) s = BCC_OK; 
+                else if (byte == FLAG) s = FLAG_RCV; 
+                else s = START; 
+                break; 
+
+            case BCC_OK: 
+                if (byte == FLAG) s = STOP; 
+                else s= START; 
+                break; 
+
+            case STOP: 
+                break; 
         }
     }
-
-    printf("Total bytes received: %d\n", nBytesBuf);
+    printf("SET received\n");
 
     // Close serial port
     if (closeSerialPort() < 0)
