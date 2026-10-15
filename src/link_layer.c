@@ -16,6 +16,9 @@
 
 #define SUPERVISION_FRAME_SIZE 5
 
+#define TRUE 1
+#define FALSE 0
+
 // Flag
 #define FLAG 0x7E
 
@@ -56,7 +59,9 @@ typedef enum {
 
 int alarmEnabled = FALSE; 
 int alarmCount = 0; 
+static volatile sig_atomic_t timedOut = FALSE; 
 
+static LinkLayer params; 
 static unsigned char txNs;
 static unsigned char rxExpectedNs;
 
@@ -168,6 +173,22 @@ static void nextState(FrameParser *p, unsigned char byte){
     }
 }
 
+static int writeAll(const unsigned char *buf, int n){
+    int sent = 0;
+    while (sent < n){
+        int w = writeBytesSerialPort(buf + sent, n - sent);
+        if (w < 0) return -1;
+        sent += w;
+    }
+    return n;
+}
+
+// Sends a supervision frame: F A C BCC1 F
+static int sendSupervision(unsigned char a, unsigned char c){
+    unsigned char buf[SUPERVISION_FRAME_SIZE] = {FLAG, a, c, a ^ c, FLAG};
+    return writeAll(buf, SUPERVISION_FRAME_SIZE);
+}
+
 
 static void resetParser(FrameParser *p, unsigned char expectedA){
     p->state = START;
@@ -180,7 +201,16 @@ static void alarmHandler(int signal)
 {
     alarmEnabled = FALSE;
     alarmCount++; 
+    timedOut = TRUE; 
 }
+static void setupAlarm(){
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1){
+        perror("sigaction");
+        exit(1);
+    }
+} 
 
 
 
@@ -189,6 +219,7 @@ static void alarmHandler(int signal)
 ////////////////////////////////////////////////
 int llOpenTx(LinkLayer llParameters)
 {
+    params = llParameters; 
     
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
@@ -207,15 +238,7 @@ int llOpenTx(LinkLayer llParameters)
     buf[3] = A_TX ^ C_SET; 
     buf[4] = FLAG; 
 
-
-    // ALARM CONFIGURATION
-    struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
-    if (sigaction(SIGALRM, &act, NULL) == -1){
-        perror("sigaction");
-        exit(1);
-    } 
-    
+    setupAlarm(); 
 
     FrameParser p; 
     resetParser(&p, A_TX);
@@ -252,6 +275,7 @@ int llOpenTx(LinkLayer llParameters)
     //UA received, connectione stablished. exit w success
     printf("UA Received\n");
 
+    txNs = 0; 
 
     /*
     // Close serial port
@@ -269,6 +293,8 @@ int llOpenTx(LinkLayer llParameters)
 
 int llOpenRx(LinkLayer llParameters)
 {
+
+    params = llParameters; 
 
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
@@ -301,6 +327,8 @@ int llOpenRx(LinkLayer llParameters)
     int bytes = writeBytesSerialPort(buf, SUPERVISION_FRAME_SIZE);
     printf("%d bytes written to serial port\n", bytes);
 
+    rxExpectedNs = 0; 
+
     /*
     // Close serial port
     if (closeSerialPort() < 0)
@@ -318,10 +346,110 @@ int llOpenRx(LinkLayer llParameters)
 ////////////////////////////////////////////////
 // LLSEND
 ////////////////////////////////////////////////
-int llSend(const unsigned char *buf, int bufSize)
-{
-    // TODO: Implement this function
+int llSend(const unsigned char *buf, int bufSize) {
+    FrameParser p; 
+    resetParser(&p, A_TX);
+    if (buf == NULL || bufSize <=  0  || bufSize > MAX_PAYLOAD_SIZE){
+        return -1;
+    }
+    unsigned char BCC2 = 0; 
+    int i = 0; 
+    while (i < bufSize){
+        BCC2 = BCC2 ^ buf[i];
+        i++; 
+    }
 
+    // F A C BCC (4) 
+    // 2* (dados + BCC2)
+    // F (1) 
+    int maxBufSize = 4 + 2*(MAX_PAYLOAD_SIZE+1) +1;
+    unsigned char stuffed[maxBufSize];
+    
+    stuffed[0] = FLAG;
+    stuffed[1] = A_TX; 
+    stuffed[2] = txNs ? C_ns1 : C_ns0; 
+    stuffed[3] = stuffed[1] ^ stuffed[2];
+    i = 4; int j = 0; 
+    while (j < bufSize){
+        if (buf[j] == 0x7D || buf[j] == 0x7E ){
+            stuffed[i] = 0x7D; 
+            i++; 
+            stuffed[i] = buf[j] ^ ESC_XOR;
+        }
+        else{
+            stuffed[i] = buf[j];
+        }
+        j++; 
+        i++;
+    }
+
+    if (BCC2 == 0x7D || BCC2 == 0x7E ){
+        stuffed[i] = 0x7D; 
+        i++; 
+        stuffed[i] = BCC2 ^ ESC_XOR;
+    }
+    else{
+        stuffed[i] = BCC2;
+    }
+    i++; 
+    stuffed[i] = FLAG; 
+    i++; 
+
+    int sendFrame = TRUE; 
+    int attempts = 0; 
+    timedOut = FALSE; 
+    while (TRUE){
+        if (timedOut){
+            timedOut = FALSE; 
+            sendFrame = TRUE; 
+            stats.timeouts++;
+        }
+
+        if (sendFrame){
+            if (attempts > params.nRetransmissions){
+                alarm(0);
+                return -1; 
+            }
+            attempts++;
+
+            if (writeAll (stuffed, i) < 0) {alarm(0); return -1;}
+            alarm(params.timeout);
+            resetParser(&p, A_TX);
+            sendFrame = FALSE; 
+            stats.iFramesSent++;
+
+        }
+
+        unsigned char byte;
+        if (readByteSerialPort(&byte) > 0) {
+            nextState(&p, byte);
+            if (p.state == STOP) {
+                
+                // receiver wants the NEXT frame → succes
+                if (p.c == (txNs ? C_RR0 : C_RR1)) {
+                    alarm(0);
+                    txNs = 1 - txNs;
+                    return bufSize;
+                }
+
+                // frame was corrupted
+                else if (p.c == (txNs ? C_REJ1 : C_REJ0)) {  
+                    stats.rejReceived++;
+                    sendFrame = TRUE;
+                }
+                else {
+                    resetParser(&p, A_TX);
+                }
+            }
+        }
+
+        }
+
+    
+
+
+
+    
     return 0;
 }
 
@@ -330,9 +458,58 @@ int llSend(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llReceive(unsigned char *packet)
 {
-    // TODO: Implement this function
+    while (TRUE){
+        FrameParser p; 
+        resetParser(&p, A_TX);
 
-    return 0;
+        unsigned char byte; 
+        while (p.state != STOP){
+            if (readByteSerialPort(&byte) > 0){
+                nextState(&p, byte);
+            }
+        }
+
+
+        switch (p.c) {
+            case C_ns0:
+            case C_ns1: {
+                int ns = (p.c == C_ns1) ? 1 : 0;
+
+                unsigned char x = 0;
+                for (int i = 0; i < p.dataLen; i++) x ^= p.data[i];
+                int bcc2Ok = (p.dataLen >= 2) && (x == 0);
+
+                if (ns != rxExpectedNs){
+                    sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
+                    continue; 
+                }
+
+                if (!bcc2Ok){
+                    sendSupervision(A_TX, rxExpectedNs ? C_REJ1 : C_REJ0);
+                    continue; 
+                }
+
+                for (int i = 0; i < p.dataLen-1; i++){packet[i] = p.data[i];}
+
+                rxExpectedNs ^= 1; 
+                sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
+                return p.dataLen-1;
+            }
+            case C_SET: {
+                sendSupervision(A_TX, C_UA);
+                continue;
+            }
+
+            case C_DISC: {
+                return -1;
+            }
+
+
+            // RR/REJ/UA aren't meant for the Rx: ignore
+            default:
+                continue;
+        }
+    }
 }
 
 ////////////////////////////////////////////////
