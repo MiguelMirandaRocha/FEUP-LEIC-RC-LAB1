@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
@@ -66,6 +67,7 @@ static unsigned char rxExpectedNs;
 typedef struct {
     // Tx
     int iFramesSent;
+    int retransmissions;
     int rejReceived;
     int timeouts;
 
@@ -73,8 +75,6 @@ typedef struct {
     int iFramesReceived;
     int duplicates;
     int bcc2Errors;
-    int rrSent;
-    int rejSent;
 } Statistics;
 
 typedef struct {
@@ -226,6 +226,7 @@ static int sendAndWait(const unsigned char *frame, int len, unsigned char expect
                 alarm(0);
                 return -1;
             }
+            if (attempts > 1) stats.retransmissions++;
 
             if (writeAll(frame, len) < 0){
                 alarm(0);
@@ -257,15 +258,20 @@ static int sendAndWait(const unsigned char *frame, int len, unsigned char expect
     }
 }
 
-static int readFrame (FrameParser *p, unsigned char expectedA){
+static int readFrame (FrameParser *p, unsigned char expectedA, int timeout){
     resetParser(p, expectedA);
+    timedOut = FALSE; 
+    alarm (timeout); 
+
     while(p->state != STOP){
+        if (timedOut) break; 
         unsigned char byte;
         int r = readByteSerialPort(&byte);
-        if (r < 0) {perror("readByteSerialPort"); return -1;}
+        if (r < 0 && errno != EINTR) {perror("readByteSerialPort"); break;}
         if (r > 0) nextState(p, byte);
     }
-    return 0;
+    alarm (0);
+    return (p->state == STOP) ? 0:-1;
 }
 
 
@@ -286,17 +292,12 @@ int llOpenTx(LinkLayer llParameters)
 
 
     // Create SET array 
-    unsigned char buf[SUPERVISION_FRAME_SIZE] = {0};
-    buf[0] = FLAG; 
-    buf[1] = A_TX; 
-    buf[2] = C_SET; 
-    buf[3] = A_TX ^ C_SET; 
-    buf[4] = FLAG; 
+    unsigned char set[] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG}; 
 
     setupAlarm(); 
 
     // No UA after all attempts, connection not established
-    if (sendAndWait(buf, SUPERVISION_FRAME_SIZE, A_TX, C_UA, NO_REJ) < 0){
+    if (sendAndWait(set, SUPERVISION_FRAME_SIZE, A_TX, C_UA, NO_REJ) < 0){
         printf("No UA after %d attempts\n", llParameters.nRetransmissions+1);
         if (closeSerialPort() < 0) {perror("closeSerialPort");}
         return -1; 
@@ -306,17 +307,6 @@ int llOpenTx(LinkLayer llParameters)
     printf("UA Received\n");
 
     txNs = 0; 
-
-    /*
-    // Close serial port
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
-
-    printf("Serial port %s closed\n", llParameters.serialPort);
-    */
 
     return 0;
 }
@@ -333,9 +323,12 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     printf("Serial port %s opened\n", llParameters.serialPort);
-    FrameParser p; 
+
+    setupAlarm();
+
+    FrameParser p;
     do {
-        if (readFrame(&p, A_TX) < 0){
+        if (readFrame(&p, A_TX, 0) < 0){
             if (closeSerialPort() < 0) {perror("closeSerialPort");}
             return -1;
         }
@@ -343,23 +336,14 @@ int llOpenRx(LinkLayer llParameters)
     printf("SET received\n");
 
 
-    if (sendSupervision(A_TX, C_UA) <0) return -1;
+    if (sendSupervision(A_TX, C_UA) <0){
+        if(closeSerialPort()<0){perror("close Serial Port");}
+        return -1; 
+    }
 
     printf("%d bytes written to serial port\n", SUPERVISION_FRAME_SIZE);
 
     rxExpectedNs = 0; 
-
-    /*
-    // Close serial port
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
-
-    printf("Serial port %s closed\n", llParameters.serialPort);
-
-    */
     return 0;
 }
 
@@ -429,7 +413,7 @@ int llReceive(unsigned char *packet)
 {
     while (TRUE){
         FrameParser p; 
-        if (readFrame(&p, A_TX) < 0) return -1;
+        if (readFrame(&p, A_TX, (params.nRetransmissions+1)*params.timeout) < 0) return -1;
 
         switch (p.c) {
             case C_ns0:
@@ -441,17 +425,20 @@ int llReceive(unsigned char *packet)
                 int bcc2Ok = (p.dataLen >= 2) && (x == 0);
 
                 if (ns != rxExpectedNs){
+                    stats.duplicates++;
                     sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
                     continue; 
                 }
 
                 if (!bcc2Ok){
+                    stats.bcc2Errors++;
                     sendSupervision(A_TX, rxExpectedNs ? C_REJ1 : C_REJ0);
                     continue; 
                 }
 
                 for (int i = 0; i < p.dataLen-1; i++){packet[i] = p.data[i];}
 
+                stats.iFramesReceived++;
                 rxExpectedNs ^= 1; 
                 sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
                 return p.dataLen-1;
