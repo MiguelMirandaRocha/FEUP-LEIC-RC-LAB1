@@ -16,7 +16,7 @@
 #define BUF_SIZE 256
 
 #define SUPERVISION_FRAME_SIZE 5
-
+#define MAX_FRAME_SIZE (4 + 2 * (MAX_PAYLOAD_SIZE + 1) + 1)
 
 // Flag
 #define FLAG 0x7E
@@ -274,6 +274,16 @@ static int readFrame (FrameParser *p, unsigned char expectedA, int timeout){
     return (p->state == STOP) ? 0:-1;
 }
 
+static int stuffByte(unsigned char *out, int i, unsigned char byte){
+    if (byte == FLAG || byte == ESC){
+        out[i++] = ESC;
+        out[i++] = byte ^ ESC_XOR;
+    }
+    else out[i++] = byte;
+    return i;
+}
+
+
 
 ////////////////////////////////////////////////
 // LLOPEN
@@ -361,41 +371,20 @@ int llSend(const unsigned char *buf, int bufSize) {
         i++; 
     }
 
-    // F A C BCC (4) 
-    // 2* (dados + BCC2)
-    // F (1) 
-    int maxBufSize = 4 + 2*(MAX_PAYLOAD_SIZE+1) +1;
-    unsigned char stuffed[maxBufSize];
-    
+    unsigned char stuffed[MAX_FRAME_SIZE];
+
     stuffed[0] = FLAG;
-    stuffed[1] = A_TX; 
-    stuffed[2] = txNs ? C_ns1 : C_ns0; 
+    stuffed[1] = A_TX;
+    stuffed[2] = txNs ? C_ns1 : C_ns0;
     stuffed[3] = stuffed[1] ^ stuffed[2];
-    i = 4; int j = 0; 
-    while (j < bufSize){
-        if (buf[j] == 0x7D || buf[j] == 0x7E ){
-            stuffed[i] = 0x7D; 
-            i++; 
-            stuffed[i] = buf[j] ^ ESC_XOR;
-        }
-        else{
-            stuffed[i] = buf[j];
-        }
-        j++; 
-        i++;
+    i = 4;
+
+    for (int j = 0; j < bufSize; j++) {
+        i = stuffByte(stuffed, i, buf[j]);
     }
 
-    if (BCC2 == 0x7D || BCC2 == 0x7E ){
-        stuffed[i] = 0x7D; 
-        i++; 
-        stuffed[i] = BCC2 ^ ESC_XOR;
-    }
-    else{
-        stuffed[i] = BCC2;
-    }
-    i++; 
-    stuffed[i] = FLAG; 
-    i++; 
+    i = stuffByte(stuffed, i, BCC2);
+    stuffed[i++] = FLAG;
 
     stats.iFramesSent++;
     
@@ -465,14 +454,74 @@ int llReceive(unsigned char *packet)
 ////////////////////////////////////////////////
 int llCloseTx()
 {
-    // TODO: Implement this function
+    int result = 0;
 
-    return 0;
+    unsigned char buf[SUPERVISION_FRAME_SIZE] = {FLAG, A_TX, C_DISC, A_TX ^ C_DISC, FLAG};
+    if (sendAndWait(buf, SUPERVISION_FRAME_SIZE, A_RX, C_DISC, NO_REJ) < 0){
+        printf("No DISC after %d attempts\n", params.nRetransmissions+1);
+        result = -1;
+    }
+    else{
+        printf("DISC Received\n");
+        if (sendSupervision(A_RX, C_UA) < 0 )result = -1;
+        sleep(1);
+    }
+
+
+    printf("\n--- Tx statistics ---\n");
+    printf("I frames sent: %d\n", stats.iFramesSent);
+    printf("Retransmissions: %d\n", stats.retransmissions);
+    printf("REJ received: %d\n", stats.rejReceived);
+    printf("Timeouts: %d\n", stats.timeouts);
+
+    if (closeSerialPort() < 0){
+        perror("closeSerialPort");
+        return -1;
+    }
+    printf("Serial port %s closed\n", params.serialPort);
+
+    return result;
 }
 
 int llCloseRx()
 {
-    // TODO: Implement this function
+    int result = 0;
+    FrameParser p;
 
-    return 0;
+    int discReceived = FALSE;
+    while (readFrame(&p, A_TX, (params.nRetransmissions+1)*params.timeout) == 0){
+        if (p.c == C_DISC) {discReceived = TRUE; break;}
+        if (isIFrame(p.c)){
+            stats.duplicates++;
+            sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
+        }
+    }
+
+    if (!discReceived){
+        printf("No DISC received\n");
+        result = -1;
+    }
+    else{
+        printf("DISC Received\n");
+        unsigned char buf[SUPERVISION_FRAME_SIZE] = {FLAG, A_RX, C_DISC, A_RX ^ C_DISC, FLAG};
+
+        if (sendAndWait(buf, SUPERVISION_FRAME_SIZE, A_RX, C_UA, NO_REJ) < 0){
+            printf("No UA after %d attempts\n", params.nRetransmissions+1);
+            result = -1;
+        }
+        else printf("UA Received\n");
+    }
+
+    printf("\n--- Rx statistics ---\n");
+    printf("I frames received: %d\n", stats.iFramesReceived);
+    printf("Duplicates: %d\n", stats.duplicates);
+    printf("BCC2 errors: %d\n", stats.bcc2Errors);
+
+    if (closeSerialPort() < 0){
+        perror("closeSerialPort");
+        return -1;
+    }
+    printf("Serial port %s closed\n", params.serialPort);
+
+    return result;
 }
