@@ -16,8 +16,6 @@
 
 #define SUPERVISION_FRAME_SIZE 5
 
-#define TRUE 1
-#define FALSE 0
 
 // Flag
 #define FLAG 0x7E
@@ -44,6 +42,8 @@
 #define ESC 0x7D
 #define ESC_XOR 0x20
 
+ #define NO_REJ -1
+
 
 //states
 typedef enum {
@@ -57,8 +57,6 @@ typedef enum {
     STOP
 } State; 
 
-int alarmEnabled = FALSE; 
-int alarmCount = 0; 
 static volatile sig_atomic_t timedOut = FALSE; 
 
 static LinkLayer params; 
@@ -199,8 +197,6 @@ static void resetParser(FrameParser *p, unsigned char expectedA){
 
 static void alarmHandler(int signal)
 {
-    alarmEnabled = FALSE;
-    alarmCount++; 
     timedOut = TRUE; 
 }
 static void setupAlarm(){
@@ -212,6 +208,65 @@ static void setupAlarm(){
     }
 } 
 
+static int sendAndWait(const unsigned char *frame, int len, unsigned char expectedA, unsigned char ackC, int rejC){
+    FrameParser p;
+    int attempts = 0;
+    int resend = TRUE;
+    timedOut = FALSE;
+
+    while (TRUE) {
+        if (timedOut){
+            timedOut = FALSE;
+            resend = TRUE;
+            stats.timeouts++;
+        }
+
+        if (resend){
+            if (attempts++ > params.nRetransmissions){
+                alarm(0);
+                return -1;
+            }
+
+            if (writeAll(frame, len) < 0){
+                alarm(0);
+                return -1;
+            }
+
+
+            alarm(params.timeout);
+            resetParser(&p, expectedA);
+            resend = FALSE;
+        }
+
+        unsigned char byte;
+        if (readByteSerialPort(&byte) <= 0) continue;
+        nextState(&p, byte);
+        if (p.state != STOP) continue;
+
+        if (p.c == ackC) {
+            alarm(0);
+            return 0;
+        }
+
+        if (p.c == rejC){
+            stats.rejReceived++;
+            resend = TRUE;
+        }
+
+        else resetParser(&p, expectedA);
+    }
+}
+
+static int readFrame (FrameParser *p, unsigned char expectedA){
+    resetParser(p, expectedA);
+    while(p->state != STOP){
+        unsigned char byte;
+        int r = readByteSerialPort(&byte);
+        if (r < 0) {perror("readByteSerialPort"); return -1;}
+        if (r > 0) nextState(p, byte);
+    }
+    return 0;
+}
 
 
 ////////////////////////////////////////////////
@@ -240,35 +295,10 @@ int llOpenTx(LinkLayer llParameters)
 
     setupAlarm(); 
 
-    FrameParser p; 
-    resetParser(&p, A_TX);
-    alarmEnabled = FALSE; 
-    alarmCount = 0; 
-    // 1 original send + nRetransmissions retries
-    while (alarmCount <= llParameters.nRetransmissions && p.state != STOP){
-        if (alarmEnabled == FALSE){
-            writeBytesSerialPort(buf, SUPERVISION_FRAME_SIZE);
-            alarm(llParameters.timeout);
-            alarmEnabled = TRUE; 
-            resetParser(&p, A_TX);
-        }
-        unsigned char byte; 
-        if (readByteSerialPort(&byte) > 0){
-            nextState(&p, byte);
-            // Valid frame but not a UA: ignore it and keep listening
-            if (p.state == STOP && p.c != C_UA) resetParser(&p, A_TX);
-        }
-    }
-    alarm(0);
-
     // No UA after all attempts, connection not established
-    if (p.state != STOP){
-        printf("No UA after %d attempts\n", alarmCount);
-        if (closeSerialPort() < 0)
-        {
-            perror("closeSerialPort");
-            return -1;
-        }
+    if (sendAndWait(buf, SUPERVISION_FRAME_SIZE, A_TX, C_UA, NO_REJ) < 0){
+        printf("No UA after %d attempts\n", llParameters.nRetransmissions+1);
+        if (closeSerialPort() < 0) {perror("closeSerialPort");}
         return -1; 
     }
 
@@ -304,28 +334,18 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
     FrameParser p; 
-    resetParser(&p, A_TX);
-    while (p.state != STOP){
-        unsigned char byte;
-        if (readByteSerialPort(&byte) > 0){
-            nextState(&p, byte);
-            // Valid frame but not a SET: ignore it and keep listening
-            if (p.state == STOP && p.c != C_SET) resetParser(&p, A_TX);
+    do {
+        if (readFrame(&p, A_TX) < 0){
+            if (closeSerialPort() < 0) {perror("closeSerialPort");}
+            return -1;
         }
-    }
+    } while (p.c != C_SET);
     printf("SET received\n");
 
 
-    // Create UA array 
-    unsigned char buf[SUPERVISION_FRAME_SIZE] = {0};
-    buf[0] = FLAG; 
-    buf[1] = A_TX; 
-    buf[2] = C_UA; 
-    buf[3] = A_TX ^ C_UA; 
-    buf[4] = FLAG; 
+    if (sendSupervision(A_TX, C_UA) <0) return -1;
 
-    int bytes = writeBytesSerialPort(buf, SUPERVISION_FRAME_SIZE);
-    printf("%d bytes written to serial port\n", bytes);
+    printf("%d bytes written to serial port\n", SUPERVISION_FRAME_SIZE);
 
     rxExpectedNs = 0; 
 
@@ -347,8 +367,6 @@ int llOpenRx(LinkLayer llParameters)
 // LLSEND
 ////////////////////////////////////////////////
 int llSend(const unsigned char *buf, int bufSize) {
-    FrameParser p; 
-    resetParser(&p, A_TX);
     if (buf == NULL || bufSize <=  0  || bufSize > MAX_PAYLOAD_SIZE){
         return -1;
     }
@@ -395,62 +413,13 @@ int llSend(const unsigned char *buf, int bufSize) {
     stuffed[i] = FLAG; 
     i++; 
 
-    int sendFrame = TRUE; 
-    int attempts = 0; 
-    timedOut = FALSE; 
-    while (TRUE){
-        if (timedOut){
-            timedOut = FALSE; 
-            sendFrame = TRUE; 
-            stats.timeouts++;
-        }
-
-        if (sendFrame){
-            if (attempts > params.nRetransmissions){
-                alarm(0);
-                return -1; 
-            }
-            attempts++;
-
-            if (writeAll (stuffed, i) < 0) {alarm(0); return -1;}
-            alarm(params.timeout);
-            resetParser(&p, A_TX);
-            sendFrame = FALSE; 
-            stats.iFramesSent++;
-
-        }
-
-        unsigned char byte;
-        if (readByteSerialPort(&byte) > 0) {
-            nextState(&p, byte);
-            if (p.state == STOP) {
-                
-                // receiver wants the NEXT frame → succes
-                if (p.c == (txNs ? C_RR0 : C_RR1)) {
-                    alarm(0);
-                    txNs = 1 - txNs;
-                    return bufSize;
-                }
-
-                // frame was corrupted
-                else if (p.c == (txNs ? C_REJ1 : C_REJ0)) {  
-                    stats.rejReceived++;
-                    sendFrame = TRUE;
-                }
-                else {
-                    resetParser(&p, A_TX);
-                }
-            }
-        }
-
-        }
-
+    stats.iFramesSent++;
     
-
-
-
-    
-    return 0;
+    if (sendAndWait(stuffed, i, A_TX, txNs ? C_RR0 : C_RR1, txNs ? C_REJ1 : C_REJ0) < 0){
+        return -1; 
+    }
+    txNs^= 1; 
+    return bufSize;
 }
 
 ////////////////////////////////////////////////
@@ -460,15 +429,7 @@ int llReceive(unsigned char *packet)
 {
     while (TRUE){
         FrameParser p; 
-        resetParser(&p, A_TX);
-
-        unsigned char byte; 
-        while (p.state != STOP){
-            if (readByteSerialPort(&byte) > 0){
-                nextState(&p, byte);
-            }
-        }
-
+        if (readFrame(&p, A_TX) < 0) return -1;
 
         switch (p.c) {
             case C_ns0:
