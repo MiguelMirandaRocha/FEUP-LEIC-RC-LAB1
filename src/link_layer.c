@@ -210,31 +210,34 @@ static void setupAlarm(){
 
 static int sendAndWait(const unsigned char *frame, int len, unsigned char expectedA, unsigned char ackC, int rejC){
     FrameParser p;
-    int attempts = 0;
+    int timeouts = 0;
+    int firstSend = TRUE;
     int resend = TRUE;
     timedOut = FALSE;
 
     while (TRUE) {
+        // Only timeouts count toward the limit: a REJ proves the Rx is alive
         if (timedOut){
             timedOut = FALSE;
-            resend = TRUE;
             stats.timeouts++;
-        }
-
-        if (resend){
-            if (attempts++ > params.nRetransmissions){
+            if (++timeouts > params.nRetransmissions){
                 alarm(0);
                 return -1;
             }
-            if (attempts > 1) stats.retransmissions++;
+            resend = TRUE;
+        }
+
+        if (resend){
+            if (!firstSend) stats.retransmissions++;
+            firstSend = FALSE;
 
             if (writeAll(frame, len) < 0){
                 alarm(0);
                 return -1;
             }
 
-
-            alarm(params.timeout);
+            // write() returns before the frame has left, so add its transmission time (10 bits per byte)
+            alarm(params.timeout + len * 10 / params.baudRate);
             resetParser(&p, expectedA);
             resend = FALSE;
         }
@@ -351,7 +354,7 @@ int llOpenRx(LinkLayer llParameters)
         return -1; 
     }
 
-    printf("%d bytes written to serial port\n", SUPERVISION_FRAME_SIZE);
+    printf("UA sent\n");
 
     rxExpectedNs = 0; 
     return 0;
@@ -432,7 +435,9 @@ int llReceive(unsigned char *packet)
                 sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
                 return p.dataLen-1;
             }
+            // Either our UA was lost or the Tx restarted: both start again from Ns = 0
             case C_SET: {
+                rxExpectedNs = 0;
                 sendSupervision(A_TX, C_UA);
                 continue;
             }
@@ -515,7 +520,7 @@ int llCloseRx()
     printf("\n--- Rx statistics ---\n");
     printf("I frames received: %d\n", stats.iFramesReceived);
     printf("Duplicates: %d\n", stats.duplicates);
-    printf("BCC2 errors: %d\n", stats.bcc2Errors);
+    printf("REJ sent (BCC2 errors): %d\n", stats.bcc2Errors);
 
     if (closeSerialPort() < 0){
         perror("closeSerialPort");
