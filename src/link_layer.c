@@ -96,11 +96,27 @@ static int isIFrame(unsigned char c) {
     return (c == C_ns0 || c == C_ns1);
 }
 
+static const char *frameName(unsigned char c){
+    switch (c){
+        case C_SET:  return "SET";
+        case C_UA:   return "UA";
+        case C_DISC: return "DISC";
+        case C_RR0:  return "RR0";
+        case C_RR1:  return "RR1";
+        case C_REJ0: return "REJ0";
+        case C_REJ1: return "REJ1";
+        case C_ns0:  return "I0";
+        case C_ns1:  return "I1";
+        default:     return "unknown";
+    }
+}
+
 // Appends a (destuffed) byte to the frame data and moves to DATA.
 // data holds the payload plus BCC2, so it fits at most MAX_PAYLOAD_SIZE + 1 bytes.
 // If the frame is too big it can't be valid: drop it and wait for the next one.
 static int storeByte(FrameParser *p, unsigned char byte){
     if (p->dataLen < 0 || p->dataLen >= (int)sizeof(p->data)){
+        printf("Frame too long, dropped\n");
         p->dataLen = 0;
         p->state = START;
         return -1;
@@ -130,8 +146,14 @@ static void nextState(FrameParser *p, unsigned char byte){
 
         case C_RCV: 
             if (byte == (p->expectedA ^ p->c)) p->state = BCC1_OK; 
-            else if (byte == FLAG) p->state = FLAG_RCV; 
-            else p->state = START; 
+            else if (byte == FLAG) {
+                printf("BCC1 error, frame ignored\n");
+                p->state = FLAG_RCV;
+            }
+            else {
+                printf("BCC1 error, frame ignored\n");
+                p->state = START;
+            }
             break; 
 
         case BCC1_OK: 
@@ -154,6 +176,7 @@ static void nextState(FrameParser *p, unsigned char byte){
 
         case ESC_RCV:
             if (byte == FLAG) {
+                printf("Invalid escape sequence, frame dropped\n");
                 p->dataLen = 0;
                 p->state = FLAG_RCV;
             }
@@ -162,6 +185,7 @@ static void nextState(FrameParser *p, unsigned char byte){
                 storeByte(p, byte ^ ESC_XOR);
             }
             else {
+                printf("Invalid escape sequence, frame dropped\n");
                 p->dataLen = 0;
                 p->state = START;
             }
@@ -220,6 +244,7 @@ static int sendAndWait(const unsigned char *frame, int len, unsigned char expect
         if (timedOut){
             timedOut = FALSE;
             stats.timeouts++;
+            printf("Timeout (%d/%d)\n", timeouts + 1, params.nRetransmissions + 1);
             if (++timeouts > params.nRetransmissions){
                 alarm(0);
                 return -1;
@@ -229,6 +254,8 @@ static int sendAndWait(const unsigned char *frame, int len, unsigned char expect
 
         if (resend){
             if (!firstSend) stats.retransmissions++;
+            // C never needs stuffing, so frame[2] is always the control field
+            printf("%s %s\n", frameName(frame[2]), firstSend ? "sent" : "retransmitted");
             firstSend = FALSE;
 
             if (writeAll(frame, len) < 0){
@@ -253,11 +280,15 @@ static int sendAndWait(const unsigned char *frame, int len, unsigned char expect
         }
 
         if (p.c == rejC){
+            printf("%s received\n", frameName(p.c));
             stats.rejReceived++;
             resend = TRUE;
         }
 
-        else resetParser(&p, expectedA);
+        else {
+            printf("%s received, ignored\n", frameName(p.c));
+            resetParser(&p, expectedA);
+        }
     }
 }
 
@@ -267,7 +298,10 @@ static int readFrame (FrameParser *p, unsigned char expectedA, int timeout){
     alarm (timeout); 
 
     while(p->state != STOP){
-        if (timedOut) break; 
+        if (timedOut) {
+            printf("Timeout, no frame received\n");
+            break;
+        }
         unsigned char byte;
         int r = readByteSerialPort(&byte);
         if (r < 0 && errno != EINTR) {perror("readByteSerialPort"); break;}
@@ -392,9 +426,11 @@ int llSend(const unsigned char *buf, int bufSize) {
     stats.iFramesSent++;
     
     if (sendAndWait(stuffed, i, A_TX, txNs ? C_RR0 : C_RR1, txNs ? C_REJ1 : C_REJ0) < 0){
+        printf("No RR after %d attempts\n", params.nRetransmissions+1);
         return -1; 
     }
     txNs^= 1; 
+    printf("RR%d received\n", txNs);
     return bufSize;
 }
 
@@ -417,12 +453,14 @@ int llReceive(unsigned char *packet)
                 int bcc2Ok = (p.dataLen >= 2) && (x == 0);
 
                 if (ns != rxExpectedNs){
+                    printf("Duplicate I%d, discarded, RR%d sent\n", ns, rxExpectedNs);
                     stats.duplicates++;
                     sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
                     continue; 
                 }
 
                 if (!bcc2Ok){
+                    printf("BCC2 error in I%d, REJ%d sent\n", ns, rxExpectedNs);
                     stats.bcc2Errors++;
                     sendSupervision(A_TX, rxExpectedNs ? C_REJ1 : C_REJ0);
                     continue; 
@@ -433,22 +471,26 @@ int llReceive(unsigned char *packet)
                 stats.iFramesReceived++;
                 rxExpectedNs ^= 1; 
                 sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
+                printf("I%d received (%d bytes), RR%d sent\n", ns, p.dataLen-1, rxExpectedNs);
                 return p.dataLen-1;
             }
             // Either our UA was lost or the Tx restarted: both start again from Ns = 0
             case C_SET: {
+                printf("SET received, UA sent, restarting from I0\n");
                 rxExpectedNs = 0;
                 sendSupervision(A_TX, C_UA);
                 continue;
             }
 
             case C_DISC: {
+                printf("DISC received before END\n");
                 return -1;
             }
 
 
             // RR/REJ/UA aren't meant for the Rx: ignore
             default:
+                printf("%s received, ignored\n", frameName(p.c));
                 continue;
         }
     }
@@ -497,6 +539,7 @@ int llCloseRx()
     while (readFrame(&p, A_TX, (params.nRetransmissions+1)*params.timeout) == 0){
         if (p.c == C_DISC) {discReceived = TRUE; break;}
         if (isIFrame(p.c)){
+            printf("Duplicate %s, discarded, RR%d sent\n", frameName(p.c), rxExpectedNs);
             stats.duplicates++;
             sendSupervision(A_TX, rxExpectedNs ? C_RR1 : C_RR0);
         }
