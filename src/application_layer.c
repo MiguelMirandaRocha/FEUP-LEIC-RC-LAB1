@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 
@@ -128,13 +129,21 @@ static void runTx(LinkLayer llParameters, const char *filename){
 // RECEIVER
 ////////////////////////////////////////////////
 
+static double nowSeconds(){
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
 // Receives packets until END, writing the DATA to file.
+// Prints the efficiency S = R / C, timed from START to END.
 // Returns 0 if the whole file arrived, -1 otherwise.
-static int receivePackets(FILE *file){
+static int receivePackets(FILE *file, int baudRate){
     unsigned char pkt[MAX_PAYLOAD_SIZE];
     unsigned int fileSize = 0, endSize = 0, received = 0;
     char fileName[MAX_NAME_SIZE + 1] = "", endName[MAX_NAME_SIZE + 1];
     int started = FALSE;
+    double start = 0;
 
     while (TRUE){
         int n = llReceive(pkt);
@@ -153,6 +162,7 @@ static int receivePackets(FILE *file){
                     received = 0;
                 }
                 started = TRUE;
+                start = nowSeconds();
 
                 if (parseControlPacket(pkt, n, &fileSize, fileName) < 0){
                     printf("Malformed START packet\n");
@@ -175,7 +185,7 @@ static int receivePackets(FILE *file){
                 break;
             }
 
-            case PKT_END:
+            case PKT_END: {
                 if (parseControlPacket(pkt, n, &endSize, endName) < 0 || endSize != fileSize || strcmp(endName, fileName) != 0){
                     printf("END packet doesn't match START\n");
                     return -1;
@@ -184,7 +194,17 @@ static int receivePackets(FILE *file){
                     printf("Received %u of %u bytes\n", received, fileSize);
                     return -1;
                 }
+
+                // R counts only the file's bits, C is the baud rate
+                double elapsed = nowSeconds() - start;
+                double r = received * 8.0 / elapsed;
+                printf("\n--- Efficiency ---\n");
+                printf("Transfer time: %.3f s\n", elapsed);
+                printf("Received bitrate (R): %.0f bit/s\n", r);
+                printf("Link capacity (C): %d bit/s\n", baudRate);
+                printf("Efficiency (S = R/C): %.3f\n\n", r / baudRate);
                 return 0;
+            }
 
             default:
                 printf("Unknown packet type %d, ignored\n", pkt[0]);
@@ -205,7 +225,7 @@ static void runRx(LinkLayer llParameters, const char *filename){
         return;
     }
 
-    if (receivePackets(file) < 0) printf("Transfer failed\n");
+    if (receivePackets(file, llParameters.baudRate) < 0) printf("Transfer failed\n");
     else printf("File received: %s\n", filename);
 
     llCloseRx();
