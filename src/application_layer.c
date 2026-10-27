@@ -23,6 +23,13 @@
 // C L2 L1 + data must fit in one llSend
 #define MAX_DATA_SIZE (MAX_PAYLOAD_SIZE - 3)
 
+// Prints a section title framed by separator lines
+static void printSection(const char *title){
+    printf("\n========================================\n");
+    printf("  %s\n", title);
+    printf("========================================\n");
+}
+
 
 static int buildControlPacket(unsigned char *pkt, unsigned char c, unsigned int fileSize, const char *fileName){
     int i = 0;
@@ -83,6 +90,7 @@ static int sendPackets(FILE *file, unsigned int fileSize, const char *fileName){
     unsigned char pkt[MAX_PAYLOAD_SIZE];
 
     int len = buildControlPacket(pkt, PKT_START, fileSize, fileName);
+    printf("\n[START] %s (%u bytes)\n", fileName, fileSize);
     if (llSend(pkt, len) < 0) return -1;
 
     int k;
@@ -90,6 +98,7 @@ static int sendPackets(FILE *file, unsigned int fileSize, const char *fileName){
         pkt[0] = PKT_DATA;
         pkt[1] = k / 256;   // L2
         pkt[2] = k % 256;   // L1
+        printf("\n[DATA] %d bytes (%ld/%u)\n", k, ftell(file), fileSize);
         if (llSend(pkt, k + 3) < 0) return -1;
     }
 
@@ -99,6 +108,7 @@ static int sendPackets(FILE *file, unsigned int fileSize, const char *fileName){
     }
 
     len = buildControlPacket(pkt, PKT_END, fileSize, fileName);
+    printf("\n[END]\n");
     if (llSend(pkt, len) < 0) return -1;
 
     return 0;
@@ -113,13 +123,14 @@ static void runTx(LinkLayer llParameters, const char *filename){
     rewind(file);
 
     if (llOpenTx(llParameters) < 0){
-        printf("Could not establish the connection\n");
+        printf("\n!! Could not establish the connection\n\n");
         fclose(file);
         return;
     }
 
-    if (sendPackets(file, fileSize, filename) < 0) printf("Transfer failed\n");
-    else printf("File sent: %s (%u bytes)\n", filename, fileSize);
+    printSection("TRANSFER (Tx)");
+    if (sendPackets(file, fileSize, filename) < 0) printf("\n!! Transfer failed\n");
+    else printf("\n>> File sent: %s (%u bytes)\n", filename, fileSize);
 
     llCloseTx();
     fclose(file);
@@ -153,7 +164,7 @@ static int receivePackets(FILE *file, int baudRate){
             case PKT_START:
                 // A second START means the Tx restarted: start the file over
                 if (started){
-                    printf("New START, restarting the file\n");
+                    printf("  ! New START, restarting the file\n");
                     rewind(file);
                     if (ftruncate(fileno(file), 0) < 0){
                         perror("ftruncate");
@@ -165,16 +176,16 @@ static int receivePackets(FILE *file, int baudRate){
                 start = nowSeconds();
 
                 if (parseControlPacket(pkt, n, &fileSize, fileName) < 0){
-                    printf("Malformed START packet\n");
+                    printf("  ! Malformed START packet\n");
                     return -1;
                 }
-                printf("Receiving %s (%u bytes)\n", fileName, fileSize);
+                printf("[START] %s (%u bytes)\n\n", fileName, fileSize);
                 break;
 
             case PKT_DATA: {
                 int k = 256 * pkt[1] + pkt[2];
                 if (n < 3 || k != n - 3){
-                    printf("DATA packet size doesn't match its L2 L1\n");
+                    printf("  ! DATA packet size doesn't match its L2 L1\n");
                     return -1;
                 }
                 if (fwrite(pkt + 3, 1, k, file) != (size_t)k) {
@@ -182,32 +193,34 @@ static int receivePackets(FILE *file, int baudRate){
                     return -1;
                 }
                 received += k;
+                printf("[DATA] %d bytes (%u/%u)\n\n", k, received, fileSize);
                 break;
             }
 
             case PKT_END: {
                 if (parseControlPacket(pkt, n, &endSize, endName) < 0 || endSize != fileSize || strcmp(endName, fileName) != 0){
-                    printf("END packet doesn't match START\n");
+                    printf("  ! END packet doesn't match START\n");
                     return -1;
                 }
                 if (received != fileSize){
-                    printf("Received %u of %u bytes\n", received, fileSize);
+                    printf("  ! Received %u of %u bytes\n", received, fileSize);
                     return -1;
                 }
 
                 // R counts only the file's bits, C is the baud rate
                 double elapsed = nowSeconds() - start;
                 double r = received * 8.0 / elapsed;
-                printf("\n--- Efficiency ---\n");
-                printf("Transfer time: %.3f s\n", elapsed);
-                printf("Received bitrate (R): %.0f bit/s\n", r);
-                printf("Link capacity (C): %d bit/s\n", baudRate);
-                printf("Efficiency (S = R/C): %.3f\n\n", r / baudRate);
+                printf("[END]\n");
+                printSection("EFFICIENCY");
+                printf("  %-22s %.3f s\n", "Transfer time:", elapsed);
+                printf("  %-22s %.0f bit/s\n", "Received bitrate (R):", r);
+                printf("  %-22s %d bit/s\n", "Link capacity (C):", baudRate);
+                printf("  %-22s %.3f\n", "Efficiency (S = R/C):", r / baudRate);
                 return 0;
             }
 
             default:
-                printf("Unknown packet type %d, ignored\n", pkt[0]);
+                printf("  ! Unknown packet type %d, ignored\n", pkt[0]);
         }
     }
 }
@@ -220,13 +233,14 @@ static void runRx(LinkLayer llParameters, const char *filename){
     }
 
     if (llOpenRx(llParameters) < 0){
-        printf("Could not establish the connection\n");
+        printf("\n!! Could not establish the connection\n\n");
         fclose(file);
         return;
     }
 
-    if (receivePackets(file, llParameters.baudRate) < 0) printf("Transfer failed\n");
-    else printf("File received: %s\n", filename);
+    printSection("TRANSFER (Rx)");
+    if (receivePackets(file, llParameters.baudRate) < 0) printf("\n!! Transfer failed\n");
+    else printf("\n>> File received: %s\n", filename);
 
     llCloseRx();
     fclose(file);
