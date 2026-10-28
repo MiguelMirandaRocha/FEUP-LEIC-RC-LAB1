@@ -30,7 +30,6 @@ The two PCs of the workbench are connected by the serial cable. One runs the tra
 | tux (rack) | `/dev/ttyS0` |
 | Desk computer | `/dev/ttyUSB0` |
 
-By default, `make run_tx` and `make run_rx` use the virtual cable ports (`/tmp/ttyS10` and `/tmp/ttyS11`), so pass the real port after the target. In the project root, replacing `<port>` with the port of that PC:
 
 ```
 make run_rx RX_SERIAL_PORT=<port>     # on the Rx PC
