@@ -9,7 +9,6 @@ This project sends a file from a transmitter (Tx) to a receiver (Rx) over an RS-
 - `src/serial_port.c`, `src/main.c`: provided code, not changed.
 - `cable/cable.c`: virtual cable for testing on a single computer (not used in the presentation).
 - `penguin.gif`: example file to send.
-- `docs/`: lab guides.
 
 ## How the Protocol Works
 
